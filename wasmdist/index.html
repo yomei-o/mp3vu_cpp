@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MP3 Player + VU Meter — 全部 C/C++ (WASM)</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing:border-box; }
+  body { font-family: system-ui,-apple-system,sans-serif; max-width:640px; margin:24px auto; padding:0 16px; line-height:1.6; }
+  h1 { font-size:1.3rem; margin-bottom:.1em; }
+  .sub { color:#888; margin-top:0; font-size:.95rem; }
+  #vu { width:100%; max-width:560px; image-rendering:auto; border-radius:10px; display:block; margin:14px auto;
+        box-shadow:0 3px 14px #0004; background:#181a20; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:center; margin:12px 0; }
+  button,label.file { font-size:1rem; padding:9px 15px; border-radius:9px; border:1px solid #888; background:#f3f3f3; cursor:pointer; }
+  @media (prefers-color-scheme: dark){ button,label.file{ background:#2a2a2a; color:#eee; } }
+  button:disabled{ opacity:.45; cursor:default; }
+  button.primary{ background:linear-gradient(135deg,#e8a13a,#d9772e); color:#1a1200; border:none; font-weight:700; }
+  #seek { width:100%; max-width:560px; display:block; margin:6px auto; }
+  #time { text-align:center; font-variant-numeric:tabular-nums; color:#999; }
+  #status { text-align:center; font-weight:600; min-height:1.4em; }
+  .note { color:#888; font-size:.85rem; margin-top:16px; }
+  a { color:#e8a13a; }
+</style>
+</head>
+<body>
+  <h1>🎚️ MP3 Player + VU / LED メーター</h1>
+  <p class="sub">MP3のデコード（minimp3）・音量レベル計算・<b>メーターの描画（VUの針・目盛り・レッドゾーン／LEDスペクトラム）</b>まで全部 C/C++ → WASM。
+  JSはブラウザ必須の部分だけ（ファイル選択・Web Audio再生・canvas転送）。</p>
+
+  <canvas id="vu" width="560" height="300"></canvas>
+  <input type="range" id="seek" min="0" max="1000" value="0" step="1" disabled>
+  <p id="time">--:-- / --:--</p>
+
+  <div class="row">
+    <label class="file">📂 MP3を開く<input type="file" id="file" accept=".mp3,audio/mpeg" style="display:none"></label>
+    <button class="primary" id="play" disabled>▶ 再生</button>
+    <button id="stop" disabled>■ 停止</button>
+    <button id="mode">🔀 表示: VU</button>
+  </div>
+  <p id="status">MP3ファイルを開いてください（ドラッグ&ドロップも可・端末内で完結し送信しません）。</p>
+
+  <p class="note">
+    メーターは C++ が RGBA バッファへ毎フレーム描画し canvas へ転送しています。<br>
+    <b>VU</b>：RMS＋VU的な針の弾道（アタック速め・戻り遅め）、ピークホールド＋クリップLED付き。
+    <b>LED</b>：自作FFTで対数帯域に分けたスペクトラムを緑/黄/赤のLED段で表示（各バンドにピーク保持ドット）。
+    ボタンで切替できます。<br>
+    ソース: <a href="https://github.com/yomei-o/mp3vu_cpp">github.com/yomei-o/mp3vu_cpp</a>（minimp3 は public domain）
+  </p>
+
+<script src="mp3.js"></script>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$('vu'), cx2=cv.getContext('2d'), fileIn=$('file'), btnPlay=$('play'), btnStop=$('stop'),
+        btnMode=$('mode'), seek=$('seek'), timeEl=$('time'), status=$('status');
+  let M=null, api={}, ctx=null, buffer=null, src=null;
+  let playing=false, startAt=0, offset=0, dur=0, raf=0, img=null, MW=560, MH=300, mode=0;
+
+  createMP3().then(mod=>{
+    M=mod;
+    api.load=M.cwrap('mp3_load','number',['number','number']);
+    api.pcm=M.cwrap('pcm_ptr','number',[]);
+    api.frames=M.cwrap('pcm_frames','number',[]);
+    api.ch=M.cwrap('pcm_channels','number',[]);
+    api.rate=M.cwrap('sample_rate','number',[]);
+    api.setMode=M.cwrap('meter_set_mode',null,['number']);
+    api.setTime=M.cwrap('meter_set_time',null,['number']);
+    api.release=M.cwrap('meter_release','number',[]);
+    api.render=M.cwrap('meter_render','number',[]);
+    api.mw=M.cwrap('meter_w','number',[]); api.mh=M.cwrap('meter_h','number',[]);
+    MW=api.mw(); MH=api.mh(); cv.width=MW; cv.height=MH; img=cx2.createImageData(MW,MH);
+    api.setMode(mode);
+    drawMeter(0); // initial (needles at rest)
+  });
+
+  function fmt(t){ if(!isFinite(t)) return '--:--'; t|=0; return (t/60|0)+':'+String(t%60).padStart(2,'0'); }
+  function blit(){ const p=api.render(); img.data.set(M.HEAPU8.subarray(p, p+MW*MH*4)); cx2.putImageData(img,0,0); }
+  function drawMeter(sec){ api.setTime(sec); blit(); }
+
+  async function loadFile(f){
+    if(!f||!M) return;
+    stop(); status.textContent='デコード中…';
+    const bytes=new Uint8Array(await f.arrayBuffer());
+    const ptr=M._malloc(bytes.length); M.HEAPU8.set(bytes,ptr);
+    const ok=api.load(ptr,bytes.length); M._free(ptr);
+    if(!ok){ status.textContent='MP3のデコードに失敗しました。'; return; }
+    api.setMode(mode);
+    const frames=api.frames(), ch=api.ch(), rate=api.rate();
+    if(!ctx) ctx=new (window.AudioContext||window.webkitAudioContext)();
+    buffer=ctx.createBuffer(ch, frames, rate);
+    const base=api.pcm()>>2;
+    for(let c=0;c<ch;c++){ const cd=buffer.getChannelData(c);
+      for(let i=0;i<frames;i++) cd[i]=M.HEAPF32[base + i*ch + c]; }
+    dur=frames/rate; offset=0; seek.disabled=false; btnPlay.disabled=false; btnStop.disabled=false;
+    seek.max=Math.max(1,Math.floor(dur*10));
+    status.textContent=`読み込み完了：${(rate/1000).toFixed(1)}kHz ${ch}ch ${fmt(dur)} — ▶で再生`;
+    timeEl.textContent=`0:00 / ${fmt(dur)}`;
+  }
+
+  fileIn.addEventListener('change', e=>{ loadFile(e.target.files[0]); e.target.value=''; });
+
+  // drag & drop anywhere on the page
+  ['dragenter','dragover'].forEach(ev=>document.addEventListener(ev,e=>{
+    e.preventDefault(); document.body.style.outline='2px dashed #e8a13a'; }));
+  ['dragleave','drop'].forEach(ev=>document.addEventListener(ev,e=>{
+    e.preventDefault(); document.body.style.outline=''; }));
+  document.addEventListener('drop', e=>{
+    const f=[...(e.dataTransfer?.files||[])].find(x=>/\.mp3$/i.test(x.name)||x.type==='audio/mpeg');
+    if(f) loadFile(f);
+  });
+
+  btnMode.addEventListener('click', ()=>{
+    mode=mode?0:1; if(M) api.setMode(mode);
+    btnMode.textContent = mode? '🔀 表示: LED' : '🔀 表示: VU';
+    if(!playing && M){ api.setTime(offset); blit(); }   // refresh immediately when paused
+  });
+
+  function curTime(){ return playing ? (ctx.currentTime-startAt+offset) : offset; }
+  function ensureLoop(){ if(!raf) raf=requestAnimationFrame(frame); }
+  function startSrc(at){
+    src=ctx.createBufferSource(); src.buffer=buffer; src.connect(ctx.destination);
+    startAt=ctx.currentTime; offset=at; src.start(0,at); playing=true;
+    btnPlay.textContent='⏸ 一時停止'; ensureLoop();
+  }
+  // stop the audio source; the animation loop keeps running so the needle
+  // decays slowly to rest (meter_release). reset=true rewinds to 0.
+  function halt(reset){
+    if(!reset && playing) offset=curTime();      // pause: remember position
+    if(src){ try{src.stop();}catch(_){}; src=null; }
+    playing=false; btnPlay.textContent='▶ 再生';
+    if(reset){ offset=0; seek.value=0; timeEl.textContent=`0:00 / ${fmt(dur)}`; }
+    ensureLoop();
+  }
+  function play(){ if(!buffer) return; ctx.resume();
+    if(playing) halt(false); else { if(offset>=dur-0.02) offset=0; startSrc(offset); } }
+  function stop(){ halt(true); }
+
+  function frame(){
+    if(playing){
+      const t=curTime();
+      drawMeter(t);                              // meter_set_time + blit (attack ballistics)
+      seek.value=Math.min(seek.max, Math.floor(t*10));
+      timeEl.textContent=`${fmt(t)} / ${fmt(dur)}`;
+      if(t>=dur){ halt(true); }                  // reached the end
+      raf=requestAnimationFrame(frame);
+    } else {
+      const moving=api.release(); blit();         // needle falls slowly to rest
+      raf = moving ? requestAnimationFrame(frame) : 0;
+    }
+  }
+  seek.addEventListener('input', ()=>{ const t=parseInt(seek.value,10)/10;
+    if(playing){ try{src.stop();}catch(_){}; src=null; startSrc(t); } else { offset=t; drawMeter(t); }
+    timeEl.textContent=`${fmt(t)} / ${fmt(dur)}`; });
+
+  btnPlay.addEventListener('click', play);
+  btnStop.addEventListener('click', stop);
+})();
+</script>
+</body>
+</html>
