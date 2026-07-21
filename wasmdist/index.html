@@ -39,6 +39,10 @@
     <button id="stop" disabled>■ 停止</button>
     <button id="mode">🔀 表示: VU</button>
   </div>
+  <div class="row">
+    <label>🕐 表示ディレイ <input type="range" id="sync" min="0" max="800" step="10" value="0">
+      <span id="syncval" style="font-variant-numeric:tabular-nums">0 ms</span></label>
+  </div>
   <p id="status">MP3ファイルを開いてください（ドラッグ&ドロップも可・端末内で完結し送信しません）。</p>
 
   <p class="note">
@@ -46,6 +50,7 @@
     <b>VU</b>：RMS＋VU的な針の弾道（アタック速め・戻り遅め）、ピークホールド＋クリップLED付き。
     <b>LED</b>：自作FFTで対数帯域に分けたスペクトラムを緑/黄/赤のLED段で表示（各バンドにピーク保持ドット）。
     ボタンで切替できます。<br>
+    音の出力にはバッファ遅延があり表示が先行しがちなので、<b>表示ディレイ</b>で耳に合わせて微調整できます（設定は保存されます）。<br>
     ソース: <a href="https://github.com/yomei-o/mp3vu_cpp">github.com/yomei-o/mp3vu_cpp</a>（minimp3 は public domain）
   </p>
 
@@ -54,7 +59,8 @@
 (function(){
   const $=id=>document.getElementById(id);
   const cv=$('vu'), cx2=cv.getContext('2d'), fileIn=$('file'), btnPlay=$('play'), btnStop=$('stop'),
-        btnMode=$('mode'), seek=$('seek'), timeEl=$('time'), status=$('status');
+        btnMode=$('mode'), seek=$('seek'), timeEl=$('time'), status=$('status'),
+        sync=$('sync'), syncval=$('syncval');
   let M=null, api={}, ctx=null, buffer=null, src=null;
   let playing=false, startAt=0, offset=0, dur=0, raf=0, img=null, MW=560, MH=300, mode=0;
 
@@ -117,7 +123,22 @@
     if(!playing && M){ api.setTime(offset); blit(); }   // refresh immediately when paused
   });
 
+  // display-delay (sync) slider: remembered across sessions
+  const savedSync=parseInt(localStorage.getItem('mp3vu_sync'),10);
+  if(isFinite(savedSync)) sync.value=savedSync;
+  syncval.textContent=`${sync.value} ms`;
+  sync.addEventListener('input', ()=>{
+    syncval.textContent=`${sync.value} ms`;
+    localStorage.setItem('mp3vu_sync', sync.value);
+    if(!playing && M){ api.setTime(Math.max(0, offset - meterLag())); blit(); }
+  });
+
   function curTime(){ return playing ? (ctx.currentTime-startAt+offset) : offset; }
+  // audio output is buffered, so what you HEAR lags ctx.currentTime. The browser
+  // reports part of it (outputLatency) but often under-reports the OS/Bluetooth
+  // delay, so the "表示ディレイ" slider lets the user dial in the rest by hand.
+  function audioLatency(){ return ctx ? (ctx.outputLatency || ctx.baseLatency || 0) : 0; }
+  function meterLag(){ return audioLatency() + (parseInt(sync.value,10)||0)/1000; }
   function ensureLoop(){ if(!raf) raf=requestAnimationFrame(frame); }
   function startSrc(at){
     src=ctx.createBufferSource(); src.buffer=buffer; src.connect(ctx.destination);
@@ -140,7 +161,7 @@
   function frame(){
     if(playing){
       const t=curTime();
-      drawMeter(t);                              // meter_set_time + blit (attack ballistics)
+      drawMeter(Math.max(0, t - meterLag()));      // align meter with what is actually heard
       seek.value=Math.min(seek.max, Math.floor(t*10));
       timeEl.textContent=`${fmt(t)} / ${fmt(dur)}`;
       if(t>=dur){ halt(true); }                  // reached the end
