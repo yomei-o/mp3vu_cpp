@@ -12,7 +12,7 @@ Two level displays, switchable with a button:
 
 ## 🎮 Live demo
 
-[▶ Open the demo](https://yomei-o.github.io/mp3vu/)
+[▶ Open the demo](https://yomei-o.github.io/mp3vu_cpp/wasmdist/)
 
 Open an MP3 (or drag & drop) → play → toggle **VU ⇄ LED** with the button.
 **Everything runs locally** — the file is never uploaded anywhere.
